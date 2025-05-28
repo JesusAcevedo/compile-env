@@ -1,0 +1,41 @@
+{
+  "_format": "hh-sol-cache-2",
+  "files": {
+    "/Users/jesusacevedo-nunez/Desktop/compile-env/contracts/MultiEscrowManager.sol": {
+      "lastModificationDate": 1748447515821,
+      "contentHash": "772145f6a80b89f26ae1cd5b242abd1d",
+      "sourceName": "contracts/MultiEscrowManager.sol",
+      "solcConfig": {
+        "version": "0.8.28",
+        "settings": {
+          "evmVersion": "paris",
+          "optimizer": {
+            "enabled": false,
+            "runs": 200
+          },
+          "outputSelection": {
+            "*": {
+              "*": [
+                "abi",
+                "evm.bytecode",
+                "evm.deployedBytecode",
+                "evm.methodIdentifiers",
+                "metadata"
+              ],
+              "": [
+                "ast"
+              ]
+            }
+          }
+        }
+      },
+      "imports": [],
+      "versionPragmas": [
+        "^0.8.20"
+      ],
+      "artifacts": [
+        "MultiEscrowManager"
+      ]
+    }
+  }
+}
