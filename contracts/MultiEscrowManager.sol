@@ -1,113 +1,158 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-contract MultiEscrowManager {
-    address public admin;
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 
-    constructor() {
-        admin = msg.sender;
-    }
+
+contract MultiEscrowManager is Initializable, UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuardUpgradeable {
+    enum EscrowStatus { Created, Approved, Released, Refunded, Disputed }
 
     struct Escrow {
         address payable buyer;
         address payable seller;
         uint256 amount;
-        bool isApproved;
-        bool isReleased;
         uint256 deadline;
+        uint256 createdAt;
+        EscrowStatus status;
     }
 
     uint256 public escrowCount;
-    mapping(uint256 => Escrow) public escrows;
+    uint256 public platformFeeBps;
+    uint256 public cancelFeeBps;
+    uint256 public constant MAX_CANCEL_FEE_BPS = 500;
+    uint256 public constant CANCEL_WINDOW = 72 hours;
+    bytes32 public termsHash;
+    address public feeCollector;
 
-    event EscrowCreated(uint256 indexed id, address indexed buyer, address indexed seller, uint256 amount);
+    mapping(uint256 => Escrow) public escrows;
+    mapping(address => bytes32) public acceptedTerms;
+
+    event EscrowCreated(uint256 indexed id, address indexed buyer, address indexed seller, uint256 amount, uint256 fee);
     event FundsApproved(uint256 indexed id);
     event FundsReleased(uint256 indexed id);
-    event EscrowRefunded(uint256 indexed id);
+    event EscrowRefunded(uint256 indexed id, uint256 fee);
     event EscrowDisputed(uint256 indexed id);
     event DisputeResolved(uint256 indexed id, address winner);
+    event PlatformFeeUpdated(uint256 newFeeBps);
+    event CancelFeeUpdated(uint256 newCancelFeeBps);
+    event TermsUpdated(bytes32 newHash);
 
-    modifier onlyBuyer(uint256 _id) {
-        require(msg.sender == escrows[_id].buyer, "Only buyer can call this");
+    modifier onlyEscrowBuyer(uint256 id) {
+        require(escrows[id].buyer == msg.sender, "Not buyer");
         _;
     }
 
-    modifier onlySeller(uint256 _id) {
-        require(msg.sender == escrows[_id].seller, "Only seller can call this");
+    modifier onlyEscrowSeller(uint256 id) {
+        require(escrows[id].seller == msg.sender, "Not seller");
         _;
     }
 
-    modifier onlyAdmin() {
-        require(msg.sender == admin, "Only admin can call this");
+    modifier validEscrow(uint256 id) {
+        require(id > 0 && id <= escrowCount, "Invalid escrow ID");
         _;
     }
 
-    function createEscrow(address payable _seller, uint256 _durationSeconds) external payable returns (uint256) {
-        require(msg.value > 0, "Escrow must hold some value");
-        require(_seller != address(0), "Invalid seller address");
+    function initialize(address _feeCollector, uint256 _platformFeeBps, uint256 _cancelFeeBps, bytes32 _termsHash) public initializer {
+        __Ownable_init();
+        __UUPSUpgradeable_init();
+        __ReentrancyGuard_init();
+        platformFeeBps = _platformFeeBps;
+        cancelFeeBps = _cancelFeeBps;
+        termsHash = _termsHash;
+        feeCollector = _feeCollector;
+    }
 
-        uint256 escrowId = escrowCount++;
-        escrows[escrowId] = Escrow({
+    function acceptTerms(bytes32 _hash) external {
+        require(_hash == termsHash, "Invalid terms");
+        acceptedTerms[msg.sender] = _hash;
+    }
+
+    function createEscrow(address payable _seller, uint256 _deadline) external payable nonReentrant {
+        require(msg.value > 0, "Must send funds");
+        require(acceptedTerms[msg.sender] == termsHash, "Terms not accepted");
+
+        escrowCount++;
+        uint256 fee = (msg.value * platformFeeBps) / 10000;
+        uint256 net = msg.value - fee;
+
+        escrows[escrowCount] = Escrow({
             buyer: payable(msg.sender),
             seller: _seller,
-            amount: msg.value,
-            isApproved: false,
-            isReleased: false,
-            deadline: block.timestamp + _durationSeconds
+            amount: net,
+            deadline: _deadline,
+            createdAt: block.timestamp,
+            status: EscrowStatus.Created
         });
 
-        emit EscrowCreated(escrowId, msg.sender, _seller, msg.value);
-        return escrowId;
+        payable(feeCollector).transfer(fee);
+        emit EscrowCreated(escrowCount, msg.sender, _seller, net, fee);
     }
 
-    function approveFunds(uint256 _id) external onlyBuyer(_id) {
-        Escrow storage esc = escrows[_id];
-        require(!esc.isApproved, "Already approved");
-        require(!esc.isReleased, "Already released");
-
-        esc.isApproved = true;
-        emit FundsApproved(_id);
+    function approveEscrow(uint256 id) external onlyEscrowBuyer(id) validEscrow(id) {
+        require(escrows[id].status == EscrowStatus.Created, "Invalid status");
+        escrows[id].status = EscrowStatus.Approved;
+        emit FundsApproved(id);
     }
 
-    function releaseFunds(uint256 _id) external onlySeller(_id) {
-        Escrow storage esc = escrows[_id];
-        require(esc.isApproved, "Not approved");
-        require(!esc.isReleased, "Already released");
+    function releaseEscrow(uint256 id) external validEscrow(id) {
+        Escrow storage e = escrows[id];
+        require(e.status == EscrowStatus.Approved, "Not approved");
+        require(msg.sender == e.buyer || msg.sender == owner(), "Not authorized");
 
-        esc.isReleased = true;
-        esc.seller.transfer(esc.amount);
-        emit FundsReleased(_id);
+        e.status = EscrowStatus.Released;
+        e.seller.transfer(e.amount);
+        emit FundsReleased(id);
     }
 
-    function refundBuyer(uint256 _id) external onlyBuyer(_id) {
-        Escrow storage esc = escrows[_id];
-        require(!esc.isReleased, "Funds already released");
-        require(block.timestamp > esc.deadline, "Escrow not expired yet");
+    function refundEscrow(uint256 id) external validEscrow(id) onlyEscrowBuyer(id) {
+        Escrow storage e = escrows[id];
+        require(e.status == EscrowStatus.Created, "Invalid status");
+        require(block.timestamp <= e.createdAt + CANCEL_WINDOW, "Too late to cancel");
 
-        esc.isReleased = true;
-        esc.buyer.transfer(esc.amount);
-        emit EscrowRefunded(_id);
+        e.status = EscrowStatus.Refunded;
+        uint256 fee = (e.amount * cancelFeeBps) / 10000;
+        payable(feeCollector).transfer(fee);
+        e.buyer.transfer(e.amount - fee);
+        emit EscrowRefunded(id, fee);
     }
 
-    function raiseDispute(uint256 _id) external {
-        Escrow storage esc = escrows[_id];
-        require(msg.sender == esc.buyer || msg.sender == esc.seller, "Not participant");
-        require(!esc.isReleased, "Escrow resolved");
+    function disputeEscrow(uint256 id) external validEscrow(id) {
+        Escrow storage e = escrows[id];
+        require(msg.sender == e.buyer || msg.sender == e.seller, "Not party to escrow");
+        require(e.status == EscrowStatus.Approved, "Invalid status");
 
-        emit EscrowDisputed(_id);
+        e.status = EscrowStatus.Disputed;
+        emit EscrowDisputed(id);
     }
 
-    function resolveDispute(uint256 _id, address payable _winner) external onlyAdmin {
-        Escrow storage esc = escrows[_id];
-        require(!esc.isReleased, "Escrow already resolved");
-        require(_winner == esc.buyer || _winner == esc.seller, "Invalid winner");
+    function resolveDispute(uint256 id, address winner) external onlyOwner validEscrow(id) {
+        Escrow storage e = escrows[id];
+        require(e.status == EscrowStatus.Disputed, "Not disputed");
 
-        esc.isReleased = true;
-        _winner.transfer(esc.amount);
-        emit DisputeResolved(_id, _winner);
+        e.status = EscrowStatus.Released;
+        payable(winner).transfer(e.amount);
+        emit DisputeResolved(id, winner);
     }
 
-    receive() external payable {
-        revert("Direct transfers not allowed");
+    function updatePlatformFee(uint256 newBps) external onlyOwner {
+        require(newBps <= 1000, "Too high");
+        platformFeeBps = newBps;
+        emit PlatformFeeUpdated(newBps);
     }
+
+    function updateCancelFee(uint256 newBps) external onlyOwner {
+        require(newBps <= MAX_CANCEL_FEE_BPS, "Too high");
+        cancelFeeBps = newBps;
+        emit CancelFeeUpdated(newBps);
+    }
+
+    function updateTermsHash(bytes32 newHash) external onlyOwner {
+        termsHash = newHash;
+        emit TermsUpdated(newHash);
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 }

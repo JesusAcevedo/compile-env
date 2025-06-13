@@ -1,1 +1,14 @@
+# Node.js
+node_modules/
 .env
+artifacts/
+cache/
+coverage/
+*.log
+
+# Hardhat specific
+typechain/
+realty-abi-bundle.json
+
+# MacOS
+.DS_Store
